@@ -132,7 +132,7 @@ class AsciiGrid2WKT extends AbstractProcessor {
 
 }
 
-object AbstractGeoIngestProcessor {
+object AsciiGrid2WKT {
 
   object Properties {
 
