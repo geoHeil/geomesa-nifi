@@ -1,3 +1,4 @@
+org.geomesa.nifi.geo.AsciiGrid2WKT
 org.geomesa.nifi.geo.PutGeoMesa
 org.geomesa.nifi.geo.PutGeoMesaKafka
 org.geomesa.nifi.geo.PutGeoTools
