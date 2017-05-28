@@ -9,16 +9,18 @@
 
 package org.geomesa.nifi.geo
 
-import java.io.InputStream
+import java.io.{IOException, InputStream, OutputStream}
 
 import com.vividsolutions.jts.geom.Geometry
 import com.vividsolutions.jts.io.WKTWriter
+import org.apache.commons.io.IOUtils
 import org.apache.nifi.annotation.documentation.{CapabilityDescription, Tags}
 import org.apache.nifi.annotation.lifecycle.{OnRemoved, OnScheduled}
 import org.apache.nifi.components.PropertyDescriptor
 import org.apache.nifi.flowfile.FlowFile
+import org.apache.nifi.flowfile.attributes.CoreAttributes
 import org.apache.nifi.processor._
-import org.apache.nifi.processor.io.InputStreamCallback
+import org.apache.nifi.processor.io.OutputStreamCallback
 import org.geomesa.nifi.geo.AbstractGeoIngestProcessor.Relationships._
 import org.geotools.gce.arcgrid.ArcGridReader
 import org.geotools.process.raster.PolygonExtractionProcess
@@ -30,11 +32,11 @@ import scala.collection.mutable
 /**
   * DTO object class, TODO consider simple feature
   *
-  * @param value     user data value for each raster point
-  * @param inputPath stores original file name
-  * @param geom      parsed WKT WGS-84 geometry linestring
+  * @param value user data value for each raster point
+  * @param geom  parsed WKT WGS-84 geometry linestring
   */
-case class GeometryId(inputPath: String, value: Double, geom: String)
+// removed path as this is kept in the flow-files attributes
+case class GeometryId(/*inputPath: String,*/ value: Double, geom: String)
 
 /**
   * Based on geotools arcgrid support http://docs.geotools.org/latest/userguide/library/coverage/arcgrid.html convert
@@ -66,13 +68,24 @@ class AsciiGrid2WKT extends AbstractProcessor {
     Option(session.get()).foreach { f =>
       try {
         getLogger.info(s"Processing file ${fullName(f)}")
-        try {
-          val fn: ProcessFn = converterIngester()
-          fn(context, session, f)
-        } finally {
-          // TODO close resources and write to file
-        }
-        session.transfer(f, SuccessRelationship)
+        val in = session.read(f)
+        val fullFlowFileName = fullName(f)
+
+        val result: Seq[GeometryId] with Growable[GeometryId] = parsAsciiGridtoWKT(in)
+
+        val csvResult: String = serializeCSV(result)
+
+        var output = session.write(f, new OutputStreamCallback() {
+          @throws[IOException]
+          def process(outputStream: OutputStream): Unit = {
+            getLogger.debug(s"created csv  ${csvResult}")
+            IOUtils.write(csvResult, outputStream, "UTF-8")
+            outputStream.close()
+            getLogger.debug("written to output stream")
+          }
+        })
+        output = session.putAttribute(output, CoreAttributes.FILENAME.key, f.getAttribute(CoreAttributes.FILENAME.key()))
+        session.transfer(output, SuccessRelationship)
       } catch {
         case e: Exception =>
           getLogger.error(s"Error: ${e.getMessage}", e)
@@ -80,40 +93,73 @@ class AsciiGrid2WKT extends AbstractProcessor {
       }
     }
 
-  protected def converterIngester(): ProcessFn =
-    (context: ProcessContext, session: ProcessSession, flowFile: FlowFile) => {
-      getLogger.debug("Running converter based ingest")
-      val fullFlowFileName = fullName(flowFile)
+  private def serializeCSV(result: Seq[GeometryId] with Growable[GeometryId]) = {
+    // https://stackoverflow.com/questions/30271823/converting-a-case-class-to-csv-in-scala
+    // TODO use avro, manually serialize to CSV
+    val lineSep = System.getProperty("line.separator")
+    val csvResult = result.map(p => p.productIterator.map {
+      case Some(value) => value
+      case None => ""
+      case rest => rest
+    }.mkString(";")).mkString(lineSep)
+    csvResult
+  }
 
-      session.read(flowFile, new InputStreamCallback {
-        override def process(in: InputStream): Unit = {
-          getLogger.info(s"Converting path $fullFlowFileName")
+  /**
+    * perform conversion from ascii grid to WKT polygons
+    *
+    * @param in flowfiles's input stream
+    * @return vectorized polygons and userdata, filename kept as attribute
+    */
+  private def parsAsciiGridtoWKT(in: InputStream) = {
+    val readRaster = new ArcGridReader(in).read(null)
+    val vectorizedFeatures = extractor.execute(readRaster, 0, true, null, null, null, null).features
+    val result: Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
+    while (vectorizedFeatures.hasNext) {
+      val vectorizedFeature = vectorizedFeatures.next()
+      val geomWKTLineString = vectorizedFeature.getDefaultGeometry match {
+        case g: Geometry => writer.write(g)
+      }
+      val userData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
 
-          val readRaster = new ArcGridReader(in).read(null)
-          val vectorizedFeatures = extractor.execute(readRaster, 0, true, null, null, null, null).features
-          val result: collection.Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
-          while (vectorizedFeatures.hasNext) {
-            // TODO rewrite in idiomatic scala?
-            val vectorizedFeature = vectorizedFeatures.next()
-            val geomWKTLineString = vectorizedFeature.getDefaultGeometry match {
-              case g: Geometry => writer.write(g)
-            }
-            val userData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
-
-            result += GeometryId(fullFlowFileName, userData, geomWKTLineString)
-          }
-          //TODO store result
-          //flowFile = session.putAttribute(flowFile, "match", "completed")
-          result
-        }
-      })
-      getLogger.debug(s"Converted file $fullFlowFileName")
+      // TODO store path name as attribute
+      result += GeometryId(/*fullFlowFileName, */ userData, geomWKTLineString)
     }
-
-
+    result
+  }
 
   // Abstract
   protected def fullName(f: FlowFile) = f.getAttribute("path") + f.getAttribute("filename")
+
+  //  protected def converterIngester(): ProcessFn =
+  //    (context: ProcessContext, session: ProcessSession, flowFile: FlowFile) => {
+  //      getLogger.debug("Running converter based ingest")
+  //      val fullFlowFileName = fullName(flowFile)
+  //
+  //      session.read(flowFile, new InputStreamCallback {
+  //        override def process(in: InputStream): Unit = {
+  //          val readRaster = new ArcGridReader(in).read(null)
+  //          val vectorizedFeatures = extractor.execute(readRaster, 0, true, null, null, null, null).features
+  //          val result: collection.Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
+  //          while (vectorizedFeatures.hasNext) {
+  //            // TODO rewrite in idiomatic scala?
+  //            val vectorizedFeature = vectorizedFeatures.next()
+  //            val geomWKTLineString = vectorizedFeature.getDefaultGeometry match {
+  //              case g: Geometry => writer.write(g)
+  //            }
+  //            val userData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
+  //
+  //            // TODO store path name as attribute
+  //            result += GeometryId(fullFlowFileName, userData, geomWKTLineString)
+  //          }
+  //
+  //          //TODO: May want to have a better default name....
+  //          //          output = session.putAttribute(output, CoreAttributes.FILENAME.key, UUID.randomUUID.toString + ".json")
+  //          //          session.transfer(result, SuccessRelationship)
+  //        }
+  //      })
+  //      getLogger.debug(s"Converted file $fullFlowFileName")
+  //    }
 
   protected override def init(context: ProcessorInitializationContext): Unit = {
     relationships = Set(SuccessRelationship, FailureRelationship).asJava
