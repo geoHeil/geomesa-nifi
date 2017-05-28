@@ -78,7 +78,6 @@ class AsciiGrid2WKT extends AbstractProcessor {
         var output = session.write(f, new OutputStreamCallback() {
           @throws[IOException]
           def process(outputStream: OutputStream): Unit = {
-            getLogger.debug(s"created csv  ${csvResult}")
             IOUtils.write(csvResult, outputStream, "UTF-8")
             outputStream.close()
             getLogger.debug("written to output stream")
