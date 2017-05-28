@@ -83,7 +83,7 @@ class AsciiGrid2WKT extends AbstractProcessor {
             getLogger.debug("written to output stream")
           }
         })
-        output = session.putAttribute(output, CoreAttributes.FILENAME.key, f.getAttribute(CoreAttributes.FILENAME.key()))
+        output = session.putAttribute(output, CoreAttributes.FILENAME.key, f.getAttribute(fullFlowFileName))
         session.transfer(output, SuccessRelationship)
       } catch {
         case e: Exception =>
