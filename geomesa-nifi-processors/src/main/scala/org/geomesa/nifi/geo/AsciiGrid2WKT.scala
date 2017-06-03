@@ -22,10 +22,11 @@ import org.apache.nifi.flowfile.attributes.CoreAttributes
 import org.apache.nifi.processor._
 import org.apache.nifi.processor.io.OutputStreamCallback
 import org.geomesa.nifi.geo.AbstractGeoIngestProcessor.Relationships._
+import org.geotools.coverage.grid.GridCoverage2D
 import org.geotools.gce.arcgrid.ArcGridReader
 import org.geotools.process.raster.PolygonExtractionProcess
 
-import scala.collection.JavaConverters._
+import scala.collection.JavaConversions._
 import scala.collection.generic.Growable
 import scala.collection.mutable
 
@@ -42,7 +43,7 @@ case class GeometryId(/*inputPath: String,*/ value: Double, geom: String)
   * Based on geotools arcgrid support http://docs.geotools.org/latest/userguide/library/coverage/arcgrid.html convert
   * ascii grid files to WKT and metadata representation
   */
-@Tags(Array("geo", "ingest", "convert", "esri", "geotools", "ascii", "ascii grid", "grid", "WKT", "wgs84"))
+@Tags(Array("geo", "ingest", "convert", "esri", "geotools", "ascii", "ascii grid", "grid", "WKT", "wgs84", "polygon", "raster"))
 @CapabilityDescription("Convert ESRi ASCII grid files to WKT")
 class AsciiGrid2WKT extends AbstractProcessor {
 
@@ -112,57 +113,50 @@ class AsciiGrid2WKT extends AbstractProcessor {
     */
   private def parsAsciiGridtoWKT(in: InputStream) = {
     val readRaster = new ArcGridReader(in).read(null)
-    val vectorizedFeatures = extractor.execute(readRaster, 0, true, null, null, null, null).features
-    val result: Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
+    parse(readRaster)
+  }
+
+  private def parse(rasterData: GridCoverage2D) = {
+
+    // reclassify (bin values of raster to -120, 0 in range 10 to shrink number of polygons
+    val r1 = org.jaitools.numeric.Range.create(Integer.valueOf(-120), true, Integer.valueOf(-110), false)
+    val r2 = org.jaitools.numeric.Range.create(Integer.valueOf(-110), true, Integer.valueOf(-100), false)
+    val r3 = org.jaitools.numeric.Range.create(Integer.valueOf(-100), true, Integer.valueOf(-90), false)
+    val r4 = org.jaitools.numeric.Range.create(Integer.valueOf(-90), true, Integer.valueOf(-80), false)
+    val r5 = org.jaitools.numeric.Range.create(Integer.valueOf(-80), true, Integer.valueOf(-70), false)
+    val r6 = org.jaitools.numeric.Range.create(Integer.valueOf(-70), true, Integer.valueOf(-60), false)
+    val r7 = org.jaitools.numeric.Range.create(Integer.valueOf(-60), true, Integer.valueOf(-50), false)
+    val r8 = org.jaitools.numeric.Range.create(Integer.valueOf(-50), true, Integer.valueOf(-40), false)
+    val r9 = org.jaitools.numeric.Range.create(Integer.valueOf(-40), true, Integer.valueOf(-30), false)
+    val r10 = org.jaitools.numeric.Range.create(Integer.valueOf(-30), true, Integer.valueOf(-20), false)
+    val r11 = org.jaitools.numeric.Range.create(Integer.valueOf(-20), true, Integer.valueOf(-10), false)
+    val r12 = org.jaitools.numeric.Range.create(Integer.valueOf(-10), true, Integer.valueOf(0), false)
+    val classificationRanges = Seq(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12)
+
+    // store geometry as reusable WKT types
+    // reverse classificationRanges to have 12 equal -120 i.e. absolutely larger values should equal larger values
+    val vectorizedFeatures = extractor.execute(rasterData, 0, true, null, null, classificationRanges.reverse, null).features
+
+    val result: collection.Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
+
     while (vectorizedFeatures.hasNext) {
       val vectorizedFeature = vectorizedFeatures.next()
       val geomWKTLineString = vectorizedFeature.getDefaultGeometry match {
         case g: Geometry => writer.write(g)
       }
-      val userData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
-
-      // TODO store path name as attribute
-      result += GeometryId(/*fullFlowFileName, */ userData, geomWKTLineString)
+      val dbUserData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
+      result += GeometryId(dbUserData, geomWKTLineString)
     }
     result
+
   }
 
   // Abstract
   protected def fullName(f: FlowFile) = f.getAttribute("path") + f.getAttribute("filename")
 
-  //  protected def converterIngester(): ProcessFn =
-  //    (context: ProcessContext, session: ProcessSession, flowFile: FlowFile) => {
-  //      getLogger.debug("Running converter based ingest")
-  //      val fullFlowFileName = fullName(flowFile)
-  //
-  //      session.read(flowFile, new InputStreamCallback {
-  //        override def process(in: InputStream): Unit = {
-  //          val readRaster = new ArcGridReader(in).read(null)
-  //          val vectorizedFeatures = extractor.execute(readRaster, 0, true, null, null, null, null).features
-  //          val result: collection.Seq[GeometryId] with Growable[GeometryId] = mutable.Buffer[GeometryId]()
-  //          while (vectorizedFeatures.hasNext) {
-  //            // TODO rewrite in idiomatic scala?
-  //            val vectorizedFeature = vectorizedFeatures.next()
-  //            val geomWKTLineString = vectorizedFeature.getDefaultGeometry match {
-  //              case g: Geometry => writer.write(g)
-  //            }
-  //            val userData = vectorizedFeature.getAttribute(1).asInstanceOf[Double]
-  //
-  //            // TODO store path name as attribute
-  //            result += GeometryId(fullFlowFileName, userData, geomWKTLineString)
-  //          }
-  //
-  //          //TODO: May want to have a better default name....
-  //          //          output = session.putAttribute(output, CoreAttributes.FILENAME.key, UUID.randomUUID.toString + ".json")
-  //          //          session.transfer(result, SuccessRelationship)
-  //        }
-  //      })
-  //      getLogger.debug(s"Converted file $fullFlowFileName")
-  //    }
-
   protected override def init(context: ProcessorInitializationContext): Unit = {
-    relationships = Set(SuccessRelationship, FailureRelationship).asJava
-    descriptors = List[PropertyDescriptor]().asJava // currently no configuration needed
+    relationships = Set(SuccessRelationship, FailureRelationship)
+    descriptors = List[PropertyDescriptor]() // currently no configuration needed
   }
 
   @OnScheduled
